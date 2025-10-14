@@ -29,60 +29,17 @@ class Lane:
         self.header = ttk.Label(self.frame, text=f"Lane {self.lane_index + 1}", font=(None, 10, "bold"))
         self.header.pack(side=tk.TOP)
 
-        self.label = ttk.Label(self.frame, text=self.format(self.elapsed_ms), font=(None, 24))
+        # Display text for the lane (use StringVar so updates are cheap)
+        self.text_var = tk.StringVar(value=self.format(self.elapsed_ms))
+        self.label = ttk.Label(self.frame, textvariable=self.text_var, font=(None, 24))
         self.label.pack(side=tk.TOP, pady=(0, 8))
 
-        # Individual Start/Stop button for the lane
-        self.stop_text = tk.StringVar(value="Start")
-        # We'll initialize as stopped; UI will be driven by parent start
-        self.stop_btn = ttk.Button(self.frame, textvariable=self.stop_text, command=self.toggle)
-        self.stop_btn.pack(side=tk.TOP)
+    # No per-lane controls in display-only mode
 
     def grid(self, row, column):
         self.frame.grid(row=row, column=column, padx=8, pady=8, sticky="nsew")
 
-    def _tick(self):
-        if not self.running:
-            return
-        now = time.perf_counter()
-        elapsed = (now - self._start_time) * 1000.0
-        self.elapsed_ms = int(elapsed)
-        self.label.config(text=self.format(self.elapsed_ms))
-        self._timer_id = self.parent.after(10, self._tick)
-
-    def start(self):
-        if self.running:
-            return
-        self.running = True
-        self.stop_text.set("Stop")
-        self._start_time = time.perf_counter() - (self.elapsed_ms / 1000.0)
-        self._timer_id = self.parent.after(10, self._tick)
-
-    def stop(self):
-        if not self.running:
-            return
-        self.running = False
-        self.stop_text.set("Start")
-        if self._timer_id:
-            try:
-                self.parent.after_cancel(self._timer_id)
-            except Exception:
-                pass
-            self._timer_id = None
-
-    def toggle(self):
-        if self.running:
-            self.stop()
-        else:
-            self.start()
-
-    def reset(self):
-        was_running = self.running
-        if was_running:
-            self.stop()
-        self.elapsed_ms = 0
-        self.label.config(text=self.format(self.elapsed_ms))
-        self._start_time = None
+    # Lane is display-only; no internal timing methods
 
 
 class TimerApp:
@@ -113,21 +70,21 @@ class TimerApp:
         for r in range(self.rows):
             self.container.rowconfigure(r, weight=1)
 
-        # Shared controls
+        # Informational label - display-only mode
         controls = ttk.Frame(root, padding=(8, 4))
         controls.pack(fill=tk.X)
-
-        self.start_all_btn = ttk.Button(controls, text="Start All", command=self.start_all)
-        self.start_all_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.reset_all_btn = ttk.Button(controls, text="Reset All", command=self.reset_all)
-        self.reset_all_btn.pack(side=tk.LEFT)
+        info = ttk.Label(controls, text="Display-only mode: showing latest serial times")
+        info.pack(side=tk.LEFT)
 
         # Serial handling
         self.serial_port = serial_port
         self.serial_baud = serial_baud
         self._serial_thread = None
         self._serial_stop = threading.Event()
+
+        # buffer for last N times (newest first)
+        self.max_history = self.lanes_count
+        self.history = []  # list of milliseconds, newest first
 
         # Start serial reader if requested and pyserial is available
         if self.serial_port and serial is not None:
@@ -198,38 +155,28 @@ class TimerApp:
                     except Exception as e:
                         print(f"Serial read error: {e}")
                         break
-                    # Print raw serial line for proofing
+                    # Read and parse line (do not print to terminal)
                     raw_str = raw.strip()
-                    if raw_str:
-                        print(f"Serial raw: {raw_str}")
                     parsed = self._parse_serial_line(raw)
-                    if parsed is not None:
-                        print(f"Parsed ms: {parsed}")
-                    else:
+                    if parsed is None:
                         # didn't parse, continue
                         continue
-                    # Replace each lane's timer with the serial timestamp and start it
-                    for lane in self.lanes:
+                    # Mirror mode: set all lanes to the same parsed timestamp immediately
+                    try:
+                        hist_snapshot = [parsed] * self.lanes_count
                         try:
-                            lane.elapsed_ms = parsed
-                            # start_time so that perf_counter - start_time == elapsed
-                            lane._start_time = time.perf_counter() - (lane.elapsed_ms / 1000.0)
-                            # ensure lane is running and scheduled
-                            lane.start()
+                            self.root.after(0, lambda h=hist_snapshot: self._refresh_labels(h))
                         except Exception:
-                            pass
+                            try:
+                                self.container.after(0, lambda h=hist_snapshot: self._refresh_labels(h))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         self._serial_thread = t
-    def start_all(self):
-        """Start all lanes."""
-        for lane in self.lanes:
-            lane.start()
-
-    def reset_all(self):
-        """Reset all lanes."""
-        for lane in self.lanes:
-            lane.reset()
+    # display-only app: no start_all/reset_all
 
     def _on_close(self):
         # Cancel any pending after callbacks in lanes
@@ -247,6 +194,25 @@ class TimerApp:
             except Exception:
                 pass
         self.root.destroy()
+
+    def _refresh_labels(self, history_snapshot):
+        """Update all lane labels from a history snapshot (newest first). Runs on main thread."""
+        for idx, lane in enumerate(self.lanes):
+            try:
+                if idx < len(history_snapshot):
+                    lane.text_var.set(self._format_time(history_snapshot[idx]))
+                else:
+                    lane.text_var.set(self._format_time(0))
+            except Exception:
+                pass
+        # Force a single redraw pass
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            try:
+                self.container.update_idletasks()
+            except Exception:
+                pass
 
 
 def main():
