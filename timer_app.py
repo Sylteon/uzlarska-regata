@@ -33,6 +33,10 @@ class Lane:
         self.text_var = tk.StringVar(value=self.format(self.elapsed_ms))
         self.label = ttk.Label(self.frame, textvariable=self.text_var, font=(None, 24))
         self.label.pack(side=tk.TOP, pady=(0, 8))
+        # whether this lane has been stopped by serial input
+        self.stopped = False
+        # no manual controls in display-only mode
+        # (stopping can still be done via numbered serial messages)
 
     # No per-lane controls in display-only mode
 
@@ -59,6 +63,8 @@ class TimerApp:
         self.lanes = []
         for i in range(self.lanes_count):
             lane = Lane(self.container, i, self._format_time)
+            # marker to know which epoch the lane was stopped in
+            lane.stopped_epoch = -1
             row = i // self.cols
             col = i % self.cols
             lane.grid(row=row, column=col)
@@ -75,12 +81,20 @@ class TimerApp:
         controls.pack(fill=tk.X)
         info = ttk.Label(controls, text="Display-only mode: showing latest serial times")
         info.pack(side=tk.LEFT)
+        # status on the right (last serial line) — displayed in GUI, not printed to terminal
+        self.status_var = tk.StringVar(value="No serial data")
+        status_lbl = ttk.Label(controls, textvariable=self.status_var)
+        status_lbl.pack(side=tk.RIGHT)
 
         # Serial handling
         self.serial_port = serial_port
         self.serial_baud = serial_baud
         self._serial_thread = None
         self._serial_stop = threading.Event()
+        # epoch counter increments on each Start Race — used to ignore stale callbacks
+        self.race_epoch = 0
+        # whether a race is currently running; Start Race sets True
+        self.race_running = False
 
         # buffer for last N times (newest first)
         self.max_history = self.lanes_count
@@ -90,7 +104,8 @@ class TimerApp:
         if self.serial_port and serial is not None:
             self._start_serial_reader(self.serial_port)
         elif self.serial_port and serial is None:
-            print(f"Warning: pyserial not available; cannot open serial port {self.serial_port}")
+            # pyserial not available — silently continue
+            pass
 
         # Bind close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -107,6 +122,12 @@ class TimerApp:
     # Serial parsing: expect lines like 'Time:m:ss:ff' where m is 1-digit minutes, ss are seconds, ff are centiseconds
     def _parse_serial_line(self, line: str) -> Optional[int]:
         line = line.strip()
+        # optionally accept a leading lane number indicator, e.g. "1 TIME:..." or "1TIME:..."
+        lane_index = None
+        if line and line[0].isdigit():
+            lane_index = int(line[0]) - 1  # convert 1-based to 0-based
+            # strip leading digit and any space
+            line = line[1:].lstrip()
         # accept case-insensitive 'Time:' or 'TIME:' prefix
         if not line.lower().startswith("time:"):
             return None
@@ -123,56 +144,149 @@ class TimerApp:
             if not (0 <= cs <= 99):
                 return None
             total_ms = (mins * 60 + secs) * 1000 + (cs * 10)
-            return total_ms
+            return (total_ms, lane_index)
         except Exception:
             return None
 
     def _start_serial_reader(self, port: str):
         def reader():
             try:
-                ser = serial.Serial(port, baudrate=self.serial_baud, timeout=1)
+                # shorter timeout so shutdown is more responsive
+                ser = serial.Serial(port, baudrate=self.serial_baud, timeout=0.2)
+                self._ser = ser
             except Exception:
-                print(f"Failed to open serial port {port} at baud {self.serial_baud}")
+                # failed to open serial port — silently return
                 # Try to list available ports to help diagnose the issue
                 try:
                     from serial.tools import list_ports
                     ports = list(list_ports.comports())
                     if ports:
-                        print("Available serial ports:")
-                        for p in ports:
-                            print(f"  {p.device} - {p.description}")
+                        # listing suppressed
+                        pass
                     else:
-                        print("No serial ports found by pyserial.")
+                        pass
                 except Exception:
-                    print("pyserial.tools.list_ports not available to enumerate ports.")
+                    pass
                 return
-            print(f"Opened serial port {port} at baud {self.serial_baud}")
-            with ser:
+            # opened serial port
+            try:
                 while not self._serial_stop.is_set():
                     try:
                         raw_bytes = ser.readline()
                         raw = raw_bytes.decode(errors="ignore")
-                    except Exception as e:
-                        print(f"Serial read error: {e}")
+                    except Exception:
                         break
-                    # Read and parse line (do not print to terminal)
+                    # Read the raw serial line and update GUI status
                     raw_str = raw.strip()
-                    parsed = self._parse_serial_line(raw)
-                    if parsed is None:
-                        # didn't parse, continue
-                        continue
-                    # Mirror mode: set all lanes to the same parsed timestamp immediately
                     try:
-                        hist_snapshot = [parsed] * self.lanes_count
+                        # schedule update of status label on main thread
                         try:
-                            self.root.after(0, lambda h=hist_snapshot: self._refresh_labels(h))
+                            self.root.after(0, lambda s=raw_str: self.status_var.set(s))
                         except Exception:
                             try:
-                                self.container.after(0, lambda h=hist_snapshot: self._refresh_labels(h))
+                                self.container.after(0, lambda s=raw_str: self.status_var.set(s))
                             except Exception:
                                 pass
                     except Exception:
                         pass
+                    # Check for start race signal (case-insensitive)
+                    if raw_str.lower() == 'start race' or 'start race' in raw_str.lower():
+                        # Schedule a main-thread start/reset action
+                        try:
+                            self.root.after(0, self._start_race)
+                        except Exception:
+                            try:
+                                self.container.after(0, self._start_race)
+                            except Exception:
+                                pass
+                        # continue reading
+                        continue
+                    parsed = self._parse_serial_line(raw)
+                    if parsed is None:
+                        # didn't parse, continue
+                        continue
+                    # debug parse result
+                    # parse debug suppressed
+                    # ignore TIME messages if a race has not been started
+                    if not self.race_running:
+                        continue
+                    # parsed may be a tuple (ms, lane_index)
+                    if isinstance(parsed, tuple):
+                        total_ms, target_lane = parsed
+                    else:
+                        total_ms, target_lane = parsed, None
+
+                    # capture current epoch so scheduled callbacks don't apply after a Start Race
+                    current_epoch = self.race_epoch
+
+                    try:
+                        # If a target lane is specified, stop that lane and set its time
+                        if target_lane is not None and 0 <= target_lane < self.lanes_count:
+                            def stop_and_set(idx=target_lane, ms=total_ms, epoch=current_epoch):
+                                # ignore if a new race started since this callback was queued
+                                if epoch != self.race_epoch:
+                                    return
+                                # action debug suppressed
+                                lane = self.lanes[idx]
+                                lane.stopped = True
+                                # record the epoch this lane was stopped in
+                                try:
+                                    lane.stopped_epoch = epoch
+                                except Exception:
+                                    pass
+                                lane.text_var.set(self._format_time(ms))
+                                try:
+                                    self.root.update_idletasks()
+                                except Exception:
+                                    pass
+
+                            try:
+                                self.root.after(0, stop_and_set)
+                            except Exception:
+                                try:
+                                    self.container.after(0, stop_and_set)
+                                except Exception:
+                                    pass
+                        else:
+                            # Mirror mode for unstopped lanes only
+                            hist_snapshot = []
+                            for _ in range(self.lanes_count):
+                                hist_snapshot.append(total_ms)
+                            # apply only to lanes that are not stopped
+                            def set_unstopped(h=hist_snapshot, epoch=current_epoch):
+                                # ignore if a new race started
+                                if epoch != self.race_epoch:
+                                    return
+                                # action debug suppressed
+                                for idx, lane in enumerate(self.lanes):
+                                    if not getattr(lane, 'stopped', False):
+                                        lane.text_var.set(self._format_time(h[idx]))
+                                try:
+                                    self.root.update_idletasks()
+                                except Exception:
+                                    pass
+
+                                # nothing else to update for Reset All in this mode
+
+                            try:
+                                self.root.after(0, set_unstopped)
+                            except Exception:
+                                try:
+                                    self.container.after(0, set_unstopped)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                try:
+                    self._ser = None
+                except Exception:
+                    pass
+
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         self._serial_thread = t
@@ -186,14 +300,73 @@ class TimerApp:
                     lane.parent.after_cancel(lane._timer_id)
                 except Exception:
                     pass
-        # Stop serial reader
-        if self._serial_thread:
-            self._serial_stop.set()
+        # Stop serial reader thread if running
+        if self._serial_thread is not None:
+            try:
+                self._serial_stop.set()
+            except Exception:
+                pass
+            # close the serial port to unblock reads
+            try:
+                if getattr(self, '_ser', None) is not None:
+                    try:
+                        self._ser.cancel_read()
+                    except Exception:
+                        pass
+                    try:
+                        self._ser.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             try:
                 self._serial_thread.join(timeout=1.0)
             except Exception:
                 pass
-        self.root.destroy()
+        # finally destroy the root to close the window
+        try:
+            self.root.destroy()
+        except Exception:
+            try:
+                self.root.quit()
+            except Exception:
+                pass
+
+    def _start_race(self):
+        """Reset internal state for a new race: clear stopped flags, reset displays and history."""
+        # bump epoch so any queued callbacks from previous races are ignored
+        try:
+            self.race_epoch += 1
+        except Exception:
+            self.race_epoch = 0
+        # mark race as running
+        try:
+            self.race_running = True
+        except Exception:
+            pass
+        # Clear history buffer
+        self.history.clear()
+        # Clear stopped flags and reset displays
+        for lane in self.lanes:
+            lane.stopped = False
+            # reset any stopped epoch marker so future callbacks won't be considered stopped
+            try:
+                lane.stopped_epoch = -1
+            except Exception:
+                pass
+            try:
+                lane.text_var.set(self._format_time(0))
+            except Exception:
+                pass
+        # Force a redraw
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            try:
+                self.container.update_idletasks()
+            except Exception:
+                pass
+
 
     def _refresh_labels(self, history_snapshot):
         """Update all lane labels from a history snapshot (newest first). Runs on main thread."""
