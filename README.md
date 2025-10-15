@@ -1,20 +1,44 @@
-# Simple Timer App
+# Regata 6-Lane Display
 
-This is a minimal Python Tkinter application that shows an elapsed timer and provides Start/Stop and Reset buttons.
+This application displays six synchronized lane timers in a 3×2 layout and mirrors authoritative time/command messages sent over a serial port.
 
-Requirements
-- Python 3.7+ (Tkinter included in standard library on most platforms)
+Key behavior
+- Display-only: the app does not independently time racers. Instead, it mirrors messages coming from a serial device (for example an Arduino) and renders them into the lane displays.
+- Six lanes: the UI shows six frames (3 columns × 2 rows), each with a lane header and a large time display.
+- Centisecond precision: times are displayed as MM:SS.cc (minutes:seconds.centiseconds).
+- Stop-by-number: if a serial line starts with a lane number (1–6) it targets that lane.
+   - Example: `1TIME` or `1 TIME` will stop lane 1 (stop-only), `1TIME:0:12:34` will set lane 1 time to 00:12.34 and stop it.
+- Markers: special commands set small markers to the right of the timer:
+   - `DISQUALIFIED` or `DISQUAL` — shows `D` in that lane
+   - `FINAL` or `FINALTIME` — shows `K` in that lane
+- Start Race: if the serial device sends a message containing `Start Race` (case-insensitive), the app resets displays and starts a new race epoch (queued/stale callbacks from previous races are ignored).
+- Graceful shutdown: closing the window stops the serial thread and closes the serial port cleanly.
+
+Serial format expectations
+- Time payload: `TIME:m:ss:ff` where m=minutes, ss=seconds (00–59), ff=centiseconds (00–99). Example: `TIME:0:12:34` → 00:12.34
+- Targeting per-lane (optional leading digit): `N` prefix targets lane `N` (1-based). Examples:
+   - `2TIME:0:45:67` → set lane 2 to 00:45.67 and stop it
+   - `3DISQUALIFIED` → mark lane 3 with `D`
+   - `Start Race` → resets all lanes and starts a new race
 
 Run
-1. Open a terminal in this folder.
-2. Run:
+1. Make sure Python 3.8+ is installed and `pyserial` is available if you plan to use a serial port:
 
-   python timer_app.py
+    pip install pyserial
 
-Usage
-- Start: begin counting time (updates every 0.1s)
-- Stop: pause the timer
-- Reset: set timer back to 00:00.00
+2. Run the app and point it to your serial port (Windows example):
 
-Notes
-- Works on Windows, macOS, and Linux where Tkinter is available.
+```powershell
+python timer_app.py --serial COM6 --baud 9600
+```
+
+Testing without hardware
+- If you don't have a device attached you can use a serial terminal program (or a virtual serial pair) to send the messages above and observe the UI.
+
+Notes and troubleshooting
+- The app suppresses terminal prints and shows the last received raw serial line internally (used for diagnostics).
+- If a message arrives before a `Start Race` event, time messages are ignored until a race is started.
+- If you want custom lane names or different behavior (e.g., multi-digit lane IDs), open an issue or ask for that enhancement.
+
+License
+- MIT
