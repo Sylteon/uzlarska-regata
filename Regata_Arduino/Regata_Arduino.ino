@@ -2,7 +2,7 @@
 
 const int startButtonPin = 2;
 const int sirenPin = 3;
-const int lanePins[NUM_LANES] = {4, 5, 6};
+const int lanePins[NUM_LANES] = {4, 5};
 
 const unsigned long debounceDelay = 50;   // ms
 const unsigned long reviewDelay = 5000;   // referee delay

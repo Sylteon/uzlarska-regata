@@ -4,6 +4,7 @@ import time
 import threading
 import argparse
 from typing import Optional
+import csv
 try:
     import serial
 except Exception:
@@ -60,7 +61,7 @@ class Lane:
 
 
 class TimerApp:
-    def __init__(self, root, lanes=6, cols=3, serial_port: Optional[str] = None, serial_baud: int = 9600):
+    def __init__(self, root, lanes=6, cols=3, serial_port: Optional[str] = None, serial_baud: int = 9600, simulate: bool = True):
         self.root = root
         self.root.title("6-Lane Timer")
 
@@ -106,6 +107,8 @@ class TimerApp:
         # buffer for last N times (newest first)
         self.max_history = self.lanes_count
         self.history = []  # list of milliseconds, newest first
+        # results CSV file (overwritten on each reset)
+        self.results_file = 'results.csv'
 
         # Start serial reader if requested and pyserial is available
         if self.serial_port and serial is not None:
@@ -113,6 +116,37 @@ class TimerApp:
         elif self.serial_port and serial is None:
             # pyserial not available — silently continue
             pass
+
+        # Optional simulator UI with buttons for testing (Start Race + per-lane Stop/DQ/K)
+        self.simulate = bool(simulate)
+        if self.simulate:
+            try:
+                sim_frame = ttk.Frame(root, padding=(8, 4))
+                sim_frame.pack(fill=tk.X)
+                # Start Race button
+                start_btn = ttk.Button(sim_frame, text="Start Race", command=lambda: self._handle_serial_line('Start Race'))
+                start_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+                # Per-lane control buttons
+                lanes_frame = ttk.Frame(root, padding=(4, 4))
+                lanes_frame.pack(fill=tk.X)
+                for i in range(self.lanes_count):
+                    lf = ttk.Frame(lanes_frame, padding=(2, 2))
+                    lf.pack(side=tk.LEFT, padx=4)
+                    ttk.Label(lf, text=f"{i+1}").pack()
+                    # Stop button -> sends e.g. '1TIME' (stop-only)
+                    btn_stop = ttk.Button(lf, text="Stop", width=6, command=(lambda n=i: self._handle_serial_line(f"{n+1}TIME")))
+                    btn_dq = ttk.Button(lf, text="DQ", width=4, command=(lambda n=i: self._handle_serial_line(f"{n+1}DISQUALIFIED")))
+                    btn_k = ttk.Button(lf, text="K", width=4, command=(lambda n=i: self._handle_serial_line(f"{n+1}FINALTIME")))
+                    btn_stop.pack()
+                    btn_dq.pack(fill=tk.X, pady=(2, 0))
+                    btn_k.pack(fill=tk.X, pady=(2, 0))
+            except Exception:
+                pass
+
+        # tick updater id for local running timers (started on Start Race)
+        self._tick_id = None
+        self._race_start_time = None
 
         # Bind close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -199,177 +233,15 @@ class TimerApp:
                         raw = raw_bytes.decode(errors="ignore")
                     except Exception:
                         break
-                    # Read the raw serial line and update GUI status
                     raw_str = raw.strip()
+                    # schedule handling of this serial line on the main thread
                     try:
-                        # schedule update of status label on main thread
-                        try:
-                            self.root.after(0, lambda s=raw_str: self.status_var.set(s))
-                        except Exception:
-                            try:
-                                self.container.after(0, lambda s=raw_str: self.status_var.set(s))
-                            except Exception:
-                                pass
+                        self.root.after(0, lambda s=raw_str: self._handle_serial_line(s))
                     except Exception:
-                        pass
-                    # Check for start race signal (case-insensitive)
-                    if raw_str.lower() == 'start race' or 'start race' in raw_str.lower():
-                        # Schedule a main-thread start/reset action
                         try:
-                            self.root.after(0, self._start_race)
+                            self.container.after(0, lambda s=raw_str: self._handle_serial_line(s))
                         except Exception:
-                            try:
-                                self.container.after(0, self._start_race)
-                            except Exception:
-                                pass
-                        # continue reading
-                        continue
-                    parsed = self._parse_serial_line(raw)
-                    if parsed is None:
-                        # didn't parse, continue
-                        continue
-
-                    # parsed is (kind, value, lane_index)
-                    try:
-                        kind, value, target_lane = parsed
-                    except Exception:
-                        # unexpected parse shape
-                        continue
-
-                    # ignore messages if a race has not been started
-                    if not self.race_running:
-                        continue
-
-                    # capture current epoch so scheduled callbacks don't apply after a Start Race
-                    current_epoch = self.race_epoch
-
-                    try:
-                        # TIME messages
-                        if kind == 'time':
-                            total_ms = value
-                            # If a target lane is specified, stop that lane and set its time
-                            if target_lane is not None and 0 <= target_lane < self.lanes_count:
-                                def stop_and_set(idx=target_lane, ms=total_ms, epoch=current_epoch):
-                                    # ignore if a new race started since this callback was queued
-                                    if epoch != self.race_epoch:
-                                        return
-                                    lane = self.lanes[idx]
-                                    lane.stopped = True
-                                    # record the epoch this lane was stopped in
-                                    try:
-                                        lane.stopped_epoch = epoch
-                                    except Exception:
-                                        pass
-                                    lane.text_var.set(self._format_time(ms))
-                                    try:
-                                        self.root.update_idletasks()
-                                    except Exception:
-                                        pass
-
-                                try:
-                                    self.root.after(0, stop_and_set)
-                                except Exception:
-                                    try:
-                                        self.container.after(0, stop_and_set)
-                                    except Exception:
-                                        pass
-                            else:
-                                # Mirror mode for unstopped lanes only: apply the time to all lanes that are not stopped
-                                hist_snapshot = [total_ms] * self.lanes_count
-
-                                def set_unstopped(h=hist_snapshot, epoch=current_epoch):
-                                    # ignore if a new race started
-                                    if epoch != self.race_epoch:
-                                        return
-                                    for idx, lane in enumerate(self.lanes):
-                                        if not getattr(lane, 'stopped', False):
-                                            lane.text_var.set(self._format_time(h[idx]))
-                                    try:
-                                        self.root.update_idletasks()
-                                    except Exception:
-                                        pass
-
-                                try:
-                                    self.root.after(0, set_unstopped)
-                                except Exception:
-                                    try:
-                                        self.container.after(0, set_unstopped)
-                                    except Exception:
-                                        pass
-
-                        # STOP-only message (e.g. "1TIME" with no payload) -> stop the lane but don't overwrite its display
-                        elif kind == 'stop':
-                            if target_lane is not None and 0 <= target_lane < self.lanes_count:
-                                def stop_only(idx=target_lane, epoch=current_epoch):
-                                    if epoch != self.race_epoch:
-                                        return
-                                    lane = self.lanes[idx]
-                                    lane.stopped = True
-                                    try:
-                                        lane.stopped_epoch = epoch
-                                    except Exception:
-                                        pass
-                                    # Do not change lane.text_var — preserve displayed time
-                                    try:
-                                        self.root.update_idletasks()
-                                    except Exception:
-                                        pass
-
-                                try:
-                                    self.root.after(0, stop_only)
-                                except Exception:
-                                    try:
-                                        self.container.after(0, stop_only)
-                                    except Exception:
-                                        pass
-
-                        # DISQUALIFIED -> mark 'D' in lane corner
-                        elif kind == 'dq':
-                            if target_lane is not None and 0 <= target_lane < self.lanes_count:
-                                def mark_d(idx=target_lane, epoch=current_epoch):
-                                    if epoch != self.race_epoch:
-                                        return
-                                    lane = self.lanes[idx]
-                                    try:
-                                        lane.marker_var.set('D')
-                                        self.root.update_idletasks()
-                                    except Exception:
-                                        pass
-
-                                try:
-                                    self.root.after(0, mark_d)
-                                except Exception:
-                                    try:
-                                        self.container.after(0, mark_d)
-                                    except Exception:
-                                        pass
-
-                        # FINALTIME or FINAL -> mark 'K' in lane corner
-                        elif kind == 'final':
-                            if target_lane is not None and 0 <= target_lane < self.lanes_count:
-                                def mark_k(idx=target_lane, epoch=current_epoch):
-                                    if epoch != self.race_epoch:
-                                        return
-                                    lane = self.lanes[idx]
-                                    try:
-                                        lane.marker_var.set('K')
-                                        self.root.update_idletasks()
-                                    except Exception:
-                                        pass
-
-                                try:
-                                    self.root.after(0, mark_k)
-                                except Exception:
-                                    try:
-                                        self.container.after(0, mark_k)
-                                    except Exception:
-                                        pass
-
-                        # otherwise ignore
-                        else:
                             pass
-                    except Exception:
-                        pass
             finally:
                 try:
                     ser.close()
@@ -383,6 +255,107 @@ class TimerApp:
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         self._serial_thread = t
+    
+    def _handle_serial_line(self, raw: str):
+        """Central handler for a single serial line. Runs on the main thread."""
+        raw_str = raw.strip()
+        # update status var
+        try:
+            self.status_var.set(raw_str)
+        except Exception:
+            pass
+
+        # Start Race signal
+        try:
+            if raw_str.lower() == 'start race' or 'start race' in raw_str.lower():
+                try:
+                    self._start_race()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        parsed = self._parse_serial_line(raw_str)
+        if parsed is None:
+            return
+
+        try:
+            kind, value, target_lane = parsed
+        except Exception:
+            return
+
+        # ignore messages if a race has not been started
+        if not self.race_running:
+            return
+
+        current_epoch = self.race_epoch
+
+        try:
+            if kind == 'time':
+                total_ms = value
+                if target_lane is not None and 0 <= target_lane < self.lanes_count:
+                    # stop and set
+                    lane = self.lanes[target_lane]
+                    lane.stopped = True
+                    try:
+                        lane.stopped_epoch = current_epoch
+                    except Exception:
+                        pass
+                    try:
+                        lane.text_var.set(self._format_time(total_ms))
+                    except Exception:
+                        pass
+                    try:
+                        self.root.update_idletasks()
+                    except Exception:
+                        pass
+                else:
+                    # mirror to unstopped lanes
+                    for idx, lane in enumerate(self.lanes):
+                        if not getattr(lane, 'stopped', False):
+                            try:
+                                lane.text_var.set(self._format_time(total_ms))
+                            except Exception:
+                                pass
+                    try:
+                        self.root.update_idletasks()
+                    except Exception:
+                        pass
+
+            elif kind == 'stop':
+                if target_lane is not None and 0 <= target_lane < self.lanes_count:
+                    lane = self.lanes[target_lane]
+                    lane.stopped = True
+                    try:
+                        lane.stopped_epoch = current_epoch
+                    except Exception:
+                        pass
+                    try:
+                        self.root.update_idletasks()
+                    except Exception:
+                        pass
+
+            elif kind == 'dq':
+                if target_lane is not None and 0 <= target_lane < self.lanes_count:
+                    lane = self.lanes[target_lane]
+                    try:
+                        lane.marker_var.set('D')
+                        self.root.update_idletasks()
+                    except Exception:
+                        pass
+
+            elif kind == 'final':
+                if target_lane is not None and 0 <= target_lane < self.lanes_count:
+                    lane = self.lanes[target_lane]
+                    try:
+                        lane.marker_var.set('K')
+                        self.root.update_idletasks()
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass
     # display-only app: no start_all/reset_all
 
     def _on_close(self):
@@ -427,6 +400,48 @@ class TimerApp:
 
     def _start_race(self):
         """Reset internal state for a new race: clear stopped flags, reset displays and history."""
+        # Before starting a new race, write the previous race's displayed results
+        # to a CSV file (overwrite each reset). We only write if there is any
+        # non-default data (a non-zero time or a marker).
+        try:
+            rows = []
+            any_data = False
+            for idx, lane in enumerate(self.lanes):
+                try:
+                    t = lane.text_var.get()
+                except Exception:
+                    t = self._format_time(0)
+                try:
+                    marker = lane.marker_var.get().strip()
+                except Exception:
+                    marker = ""
+                stopped = bool(getattr(lane, 'stopped', False))
+                rows.append((idx + 1, t, marker, int(stopped)))
+                if t != self._format_time(0) or marker:
+                    any_data = True
+            if any_data:
+                try:
+                    # prepare CSV rows: replace time with 'D' when marker == 'D'
+                    csv_rows = []
+                    for lane_idx, t, marker, stopped in rows:
+                        out_time = t
+                        if marker == 'D':
+                            out_time = 'D'
+                        csv_rows.append((lane_idx, out_time, marker))
+                    with open(self.results_file, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(['lane', 'time', 'marker'])
+                        for r in csv_rows:
+                            writer.writerow(r)
+                    try:
+                        self.status_var.set(f"Saved results to {self.results_file}")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # bump epoch so any queued callbacks from previous races are ignored
         try:
             self.race_epoch += 1
@@ -435,6 +450,46 @@ class TimerApp:
         # mark race as running
         try:
             self.race_running = True
+        except Exception:
+            pass
+        # start local ticking so the UI shows running times until lanes are stopped
+        try:
+            # cancel previous tick if any
+            if getattr(self, '_tick_id', None):
+                try:
+                    self.root.after_cancel(self._tick_id)
+                except Exception:
+                    pass
+            self._race_start_time = time.time()
+            def tick():
+                try:
+                    if not self.race_running:
+                        return
+                    now = time.time()
+                    elapsed_ms = int((now - self._race_start_time) * 1000)
+                    for lane in self.lanes:
+                        if not getattr(lane, 'stopped', False):
+                            try:
+                                lane.text_var.set(self._format_time(elapsed_ms))
+                            except Exception:
+                                pass
+                    try:
+                        self._tick_id = self.root.after(50, tick)
+                    except Exception:
+                        try:
+                            self._tick_id = self.container.after(50, tick)
+                        except Exception:
+                            self._tick_id = None
+                except Exception:
+                    pass
+            # schedule first tick
+            try:
+                self._tick_id = self.root.after(50, tick)
+            except Exception:
+                try:
+                    self._tick_id = self.container.after(50, tick)
+                except Exception:
+                    self._tick_id = None
         except Exception:
             pass
         # Clear history buffer
