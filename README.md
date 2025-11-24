@@ -35,6 +35,33 @@ python timer_app.py --serial COM6 --baud 9600
 Testing without hardware
 - If you don't have a device attached you can use a serial terminal program (or a virtual serial pair) to send the messages above and observe the UI.
 
+Built-in simulator (no hardware required)
+- The app includes a simple built-in simulator to make testing easy without connecting a serial device.
+- Start the app with `--simulate` to show simulator controls:
+
+```powershell
+python timer_app.py --simulate
+```
+
+- Simulator controls:
+   - `Start Race` — resets displays and starts local ticking so timers count up.
+   - Per-lane controls: `Stop`, `DQ`, `K` — these simulate the same serial messages the app accepts (stop-only, disqualify, final).
+   - Buttons call the same internal handler as the serial reader, so simulator behavior matches real inputs.
+
+CSV export (results)
+- On each new race (when `Start Race` is triggered), the app writes the last race's displayed results to `results.csv` in the app folder. The file is overwritten on each reset.
+- CSV format:
+   - Header: `lane,time,marker`
+   - Each row: lane number (1-based), time string (MM:SS.cc) or `D` if the lane was disqualified, and the marker (`D` or `K` or empty).
+   - Example row: `2,00:45.67,K`
+
+Run both simulator and a serial port
+- You can combine `--simulate` with `--serial` if you want to see simulator-driven events alongside real serial input:
+
+```powershell
+python timer_app.py --serial COM6 --baud 9600 --simulate
+```
+
 Notes and troubleshooting
 - The app suppresses terminal prints and shows the last received raw serial line internally (used for diagnostics).
 - If a message arrives before a `Start Race` event, time messages are ignored until a race is started.
