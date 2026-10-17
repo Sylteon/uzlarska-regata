@@ -5,37 +5,36 @@ import threading
 import argparse
 from typing import Optional
 import csv
-try:
-    import serial
-except Exception:
-    serial = None
-
+import serial
+from PIL import Image, ImageTk
 
 class Lane:
     """Represents a single timer lane with independent stop control."""
-    def __init__(self, parent, lane_index, format_func):
+    def __init__(self, parent, lane_index, format_func, bg_color="SystemButtonFace"):
         self.parent = parent
         self.lane_index = lane_index
         self.format = format_func
+        self.bg_color = bg_color
 
         self.running = False
         self._start_time = None
         self.elapsed_ms = 0
         self._timer_id = None
 
-        # Frame for lane
-        self.frame = ttk.Frame(parent, relief=tk.RIDGE, padding=8)
+        # Frame for lane - use tk.Frame to show background image
+        self.frame = tk.Frame(parent, relief=tk.RIDGE, bd=2, bg=bg_color)
+        self.frame.configure(highlightthickness=0)
 
         # Lane number header
-        self.header = ttk.Label(self.frame, text=f"Lane {self.lane_index + 1}", font=(None, 10, "bold"))
-        self.header.pack(side=tk.TOP)
+        self.header = tk.Label(self.frame, text=f"Dráha {self.lane_index + 1}", font=(None, 30, "bold"), bg=bg_color, fg="black")
+        self.header.pack(side=tk.TOP, padx=5, pady=5)
 
         # Display text for the lane (use StringVar so updates are cheap)
         self.text_var = tk.StringVar(value=self.format(self.elapsed_ms))
         # Create a horizontal container so the marker sits to the right of the timer
-        content = ttk.Frame(self.frame)
+        content = tk.Frame(self.frame, bg=bg_color)
         content.pack(side=tk.TOP, pady=(0, 8), fill=tk.X)
-        self.label = ttk.Label(content, textvariable=self.text_var, font=(None, 24))
+        self.label = tk.Label(content, textvariable=self.text_var, font=(None, 70), bg=bg_color, fg="black")
         # add a bit more right padding so the marker doesn't collide with the timer
         # allow the label to expand so the marker doesn't change overall frame size
         self.label.pack(side=tk.LEFT, padx=(0, 12), fill=tk.X, expand=True)
@@ -48,47 +47,77 @@ class Lane:
         # won't resize the lane frame. initialize with a space so the width is kept.
         self.marker_var = tk.StringVar(value=" ")
         # make the marker larger and bold
-        self.marker_label = ttk.Label(content, textvariable=self.marker_var, font=(None, 20, 'bold'), width=2, anchor='center')
+        self.marker_label = tk.Label(content, textvariable=self.marker_var, font=(None, 64, 'bold'), width=2, anchor='center', bg=bg_color, fg="red")
         # place marker immediately to the right of the timer
-        self.marker_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.marker_label.pack(side=tk.LEFT, padx=(0, 15))
 
     # No per-lane controls in display-only mode
 
-    def grid(self, row, column):
-        self.frame.grid(row=row, column=column, padx=8, pady=8, sticky="nsew")
+    def grid(self, row, column, columnspan=1):
+        # Use sticky="ew" (not "nsew") to prevent vertical expansion
+        # This keeps frames at their natural height even when window resizes
+        self.frame.grid(row=row, column=column, columnspan=columnspan, padx=8, pady=8, sticky="ew")
 
     # Lane is display-only; no internal timing methods
 
 
 class TimerApp:
-    def __init__(self, root, lanes=6, cols=3, serial_port: Optional[str] = None, serial_baud: int = 9600, simulate: bool = True):
+    def __init__(self, root, lanes=6, cols=3, serial_port: Optional[str] = None, serial_baud: int = 9600, simulate: bool = False):
         self.root = root
-        self.root.title("6-Lane Timer")
+        self.root.title("Časomíra - Uzlařská regata")
 
         self.lanes_count = lanes
         self.cols = cols
         self.rows = (lanes + cols - 1) // cols
 
         # Container for lanes
-        self.container = ttk.Frame(root, padding=12)
+        self.container = tk.Frame(root)
         self.container.pack(fill=tk.BOTH, expand=True)
+        
+        # Create a centered frame inside the container
+        centered_frame = tk.Frame(self.container)
+        centered_frame.pack(expand=True)
+        
+        # Store reference so we can add lanes to it
+        self.lanes_frame = centered_frame
 
         # Create lanes
         self.lanes = []
+        last_row_offset = 0
+        lanes_in_last_row = 0
+        
         for i in range(self.lanes_count):
-            lane = Lane(self.container, i, self._format_time)
+            lane = Lane(self.lanes_frame, i, self._format_time, "SystemButtonFace")
             # marker to know which epoch the lane was stopped in
             lane.stopped_epoch = -1
             row = i // self.cols
             col = i % self.cols
+            
+            # Calculate offset for incomplete last row
+            if row == self.rows - 1:  # Last row
+                lanes_in_last_row = self.lanes_count - (row * self.cols)
+                if lanes_in_last_row < self.cols:
+                    last_row_offset = (self.cols - lanes_in_last_row) // 2
+                    col = (i % self.cols) + last_row_offset
+            
             lane.grid(row=row, column=col)
             self.lanes.append(lane)
 
-        # Configure grid weights so lanes expand
+        # Configure grid weights so lanes expand only horizontally
+        # For incomplete last row, set weight=0 for empty columns to keep frames centered
         for c in range(self.cols):
-            self.container.columnconfigure(c, weight=1)
+            # If last row is incomplete, don't give weight to offset columns
+            if lanes_in_last_row > 0 and lanes_in_last_row < self.cols:
+                # Empty columns on the left and right should not expand
+                if c < last_row_offset or c >= last_row_offset + lanes_in_last_row:
+                    self.lanes_frame.columnconfigure(c, weight=0, minsize=0)
+                else:
+                    self.lanes_frame.columnconfigure(c, weight=1)
+            else:
+                self.lanes_frame.columnconfigure(c, weight=1)
+        
         for r in range(self.rows):
-            self.container.rowconfigure(r, weight=1)
+            self.lanes_frame.rowconfigure(r, weight=0)  # weight=0 prevents vertical expansion
 
         # (Removed visible informational/status labels while keeping the internal
         # status var so serial reader updates remain safe.)
@@ -148,8 +177,24 @@ class TimerApp:
         self._tick_id = None
         self._race_start_time = None
 
-        # Bind close
+        # Fullscreen state tracking
+        self._is_fullscreen = False
+        self._locked_height = None
+
+        # Bind close and F11 for fullscreen toggle
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind('<F11>', self._toggle_fullscreen)
+
+        # Update window height based on content and lock it
+        self.root.update_idletasks()
+        try:
+            self.root.resizable(True, False)  # allow width resize, lock height
+            # Capture the computed height
+            self._locked_height = self.root.winfo_height()
+            # Bind Configure event to enforce height lock
+            self.root.bind('<Configure>', self._enforce_height_lock)
+        except Exception:
+            pass
 
     def _format_time(self, ms: int) -> str:
         # ms is integer milliseconds
@@ -397,6 +442,26 @@ class TimerApp:
                 self.root.quit()
             except Exception:
                 pass
+
+    def _toggle_fullscreen(self, event=None):
+        """Toggle fullscreen mode on F11."""
+        try:
+            self._is_fullscreen = not self._is_fullscreen
+            self.root.attributes('-fullscreen', self._is_fullscreen)
+        except Exception:
+            pass
+
+    def _enforce_height_lock(self, event=None):
+        """Prevent height changes by resetting geometry if height differs."""
+        try:
+            if self._locked_height and event:
+                current_height = self.root.winfo_height()
+                if current_height != self._locked_height and not self._is_fullscreen:
+                    # Reset geometry to locked height but keep current width
+                    current_width = self.root.winfo_width()
+                    self.root.geometry(f"{current_width}x{self._locked_height}")
+        except Exception:
+            pass
 
     def _start_race(self):
         """Reset internal state for a new race: clear stopped flags, reset displays and history."""
